@@ -77,7 +77,13 @@ type Repo struct {
 	Current string // branch actually checked out
 	Head    string // commit checked out locally
 	Tip     string // head of the branch on origin, after fetch
-	Dirty   bool
+	// LocalTip is the head of the local branch ref ("" when detached or absent).
+	// Ahead/Behind compare it to Tip, so unpushed work on a feature branch is never
+	// mistaken for unpushed work on the release branch.
+	LocalTip string
+	Ahead    int // commits on the local branch that origin does not have
+	Behind   int // commits on origin that the local branch does not have
+	Dirty    bool
 	// DirtyFiles lists tracked changes that made the repository dirty.
 	DirtyFiles []string
 	// Untracked lists untracked paths, which are reported but do not block a run.
@@ -94,9 +100,9 @@ type Repo struct {
 	// Set by the bump steps before they touch the working tree.
 	Snapshot *modSnapshot
 
-	// remotes caches the branch names seen on origin so detection is one ls-remote;
-	// branchDetected stops the choice (and its warnings) being recomputed.
-	remotes        map[string]bool
+	// remotes caches the origin branches and their commit hashes so detection is one
+	// ls-remote; branchDetected stops the choice (and its warnings) being recomputed.
+	remotes        map[string]string
 	branchDetected bool
 	Warnings       []string
 }

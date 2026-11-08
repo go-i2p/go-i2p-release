@@ -41,6 +41,11 @@ func (p *Pipeline) Run(ctx context.Context, mode string) error {
 		p.plan()
 		return nil
 	case modeTip:
+		// Publish unpushed commits first: go get resolves a peer by commit over the
+		// network, so the tip we pin must already be on origin.
+		if err := p.pushUnpushed(ctx); err != nil {
+			return err
+		}
 		if err := p.bumpToTip(ctx); err != nil {
 			return err
 		}
@@ -58,6 +63,9 @@ func (p *Pipeline) Run(ctx context.Context, mode string) error {
 		// Fail before writing anything if an existing tag violates the policy, rather
 		// than after commits are already checked in and pushed.
 		if err := p.preflightTags(ctx); err != nil {
+			return err
+		}
+		if err := p.pushUnpushed(ctx); err != nil {
 			return err
 		}
 		if err := p.bumpToTip(ctx); err != nil {
@@ -138,7 +146,7 @@ func (p *Pipeline) inspect(ctx context.Context) error {
 		}
 	}
 
-	var dirty, behind, mismatched, unresolved, skipped []string
+	var dirty, behind, mismatched, unresolved, skipped, unpushed []string
 	for _, name := range p.scan.Order {
 		r := p.scan.Repos[name]
 		if r.SkipReason != "" {
@@ -155,14 +163,20 @@ func (p *Pipeline) inspect(ctx context.Context) error {
 		if r.Dirty {
 			dirty = append(dirty, name)
 		}
-		if r.Tip != r.Head {
+		if r.Ahead > 0 {
+			unpushed = append(unpushed, fmt.Sprintf("%s (%d)", name, r.Ahead))
+		}
+		if r.Behind > 0 {
 			behind = append(behind, name)
 		}
 		if p.cfg.Quiet {
 			continue
 		}
 		var notes []string
-		if r.Tip != r.Head {
+		if r.Ahead > 0 {
+			notes = append(notes, fmt.Sprintf("%d unpushed", r.Ahead))
+		}
+		if r.Tip != r.LocalTip && r.Behind > 0 {
 			notes = append(notes, "origin/"+r.Branch+"@"+short(r.Tip))
 		}
 		if r.Dirty {
@@ -225,9 +239,17 @@ func (p *Pipeline) inspect(ctx context.Context) error {
 				strings.Join(detail, "\n  "))
 		}
 	}
+	if len(unpushed) > 0 {
+		if p.readOnly || p.cfg.DryRun {
+			p.journal.logf("  note: unpushed local commits in %s; a real run pushes them to origin before rewriting any go.mod",
+				strings.Join(unpushed, ", "))
+		} else {
+			p.journal.logf("  ! unpushed local commits in %s", strings.Join(unpushed, ", "))
+		}
+	}
 	if len(behind) > 0 {
 		if p.cfg.DryRun || p.readOnly {
-			p.journal.logf("  note: %s differ from origin; a real run fast-forwards them first", strings.Join(behind, ", "))
+			p.journal.logf("  note: %s are behind origin; a real run fast-forwards them first", strings.Join(behind, ", "))
 		} else {
 			p.journal.logf("  ! still behind origin after sync: %s (diverged, or no remote branch)", strings.Join(behind, ", "))
 		}
@@ -329,14 +351,52 @@ func (p *Pipeline) readState(ctx context.Context, r *Repo) error {
 	branch, remote := p.detectBranch(ctx, r)
 	r.branchDetected = true
 	r.Branch = branch
-	r.RemoteBranch = branch != "" && (remote == nil || remote[branch])
-	tip, err := p.exec.Quiet(ctx, r.Path, "git", "rev-parse", "--verify", "refs/remotes/origin/"+r.Branch)
-	if err != nil {
-		// Unknown remote branch: offline, or the repository was never pushed.
-		tip = head
-	}
-	r.Tip = tip
+	r.RemoteBranch = branch != "" && (remote == nil || remote[branch] != "")
 	r.Current, _ = p.exec.Quiet(ctx, r.Path, "git", "rev-parse", "--abbrev-ref", "HEAD")
+
+	// The local branch ref, not HEAD: unpushed work is measured on the branch that
+	// would actually be pushed, so a checked-out feature branch or detached HEAD is
+	// never mistaken for unpushed work on the release branch.
+	if branch != "" {
+		r.LocalTip, _ = p.exec.Quiet(ctx, r.Path, "git", "rev-parse", "--verify", "refs/heads/"+branch)
+	}
+	// The tip is what origin holds right now, taken from the same ls-remote that
+	// chose the branch. Using it rather than refs/remotes/origin/<branch> means a
+	// stale fetch cannot make an unpushed local commit look like the tip. When
+	// origin is unreachable we fall back to the remote-tracking ref, then the local
+	// branch, so an offline run still plans against something.
+	switch {
+	case remote != nil && remote[branch] != "":
+		r.Tip = remote[branch]
+	default:
+		tip, err := p.exec.Quiet(ctx, r.Path, "git", "rev-parse", "--verify", "refs/remotes/origin/"+branch)
+		if err != nil || tip == "" {
+			tip = r.LocalTip
+		}
+		r.Tip = tip
+	}
+	// Ahead/behind between the local branch and origin's tip. Ahead is the count of
+	// commits go get cannot resolve yet, which is what the push-before-bump step acts
+	// on; behind is origin commits the local branch is missing. The comparison object
+	// must exist locally: with --sync the fetch put it there, but offline or with
+	// --sync=false we fall back to the remote-tracking ref so unpushed work is still
+	// detected against the last state we saw on origin.
+	compare := r.Tip
+	if compare != "" && r.LocalTip != "" {
+		if _, err := p.exec.Quiet(ctx, r.Path, "git", "rev-parse", "--verify", compare+"^{commit}"); err != nil {
+			if tr, terr := p.exec.Quiet(ctx, r.Path, "git", "rev-parse", "--verify", "refs/remotes/origin/"+branch); terr == nil && tr != "" {
+				compare = tr
+			}
+		}
+	}
+	if r.LocalTip != "" && compare != "" && r.LocalTip != compare {
+		if n, err := p.exec.Quiet(ctx, r.Path, "git", "rev-list", "--count", compare+".."+r.LocalTip); err == nil {
+			r.Ahead = atoiDefault(n, 0)
+		}
+		if n, err := p.exec.Quiet(ctx, r.Path, "git", "rev-list", "--count", r.LocalTip+".."+compare); err == nil {
+			r.Behind = atoiDefault(n, 0)
+		}
+	}
 	// Stale stat data (a freshly copied worktree, for example) can make git report
 	// phantom modifications, so refresh the index before asking for status.
 	p.exec.Quiet(ctx, r.Path, "git", "update-index", "--refresh")
@@ -382,9 +442,11 @@ func (p *Pipeline) syncWorktree(ctx context.Context, r *Repo) {
 	}
 }
 
-// remoteBranches lists the branches that actually exist on origin. One network
-// call per repository; an empty result means origin is unreachable (offline).
-func (p *Pipeline) remoteBranches(ctx context.Context, r *Repo) map[string]bool {
+// remoteBranches lists the branches that actually exist on origin, mapped to the
+// commit each points at. One network call per repository; a nil result means origin
+// is unreachable (offline). The hash is the authoritative current tip, so it does
+// not depend on how fresh the local remote-tracking refs are.
+func (p *Pipeline) remoteBranches(ctx context.Context, r *Repo) map[string]string {
 	if r.remotes != nil {
 		return r.remotes
 	}
@@ -392,19 +454,17 @@ func (p *Pipeline) remoteBranches(ctx context.Context, r *Repo) map[string]bool 
 	if err != nil {
 		return nil
 	}
-	set := map[string]bool{}
+	set := map[string]string{}
 	for _, line := range splitLines(out) {
 		fields := strings.Fields(line)
 		if len(fields) < 2 {
 			continue
 		}
 		if i := strings.LastIndex(fields[1], "/"); i >= 0 {
-			set[fields[1][i+1:]] = true
+			set[fields[1][i+1:]] = fields[0]
 		}
 	}
-	if err == nil {
-		r.remotes = set
-	}
+	r.remotes = set
 	return set
 }
 
@@ -413,7 +473,7 @@ func (p *Pipeline) remoteBranches(ctx context.Context, r *Repo) map[string]bool 
 // main -- so it is honoured only when the branch really exists on origin. Falling
 // back to the checked-out branch last means a feature branch is never mistaken for
 // a default. Returns "" when nothing can be confirmed, which blocks a writing run.
-func (p *Pipeline) detectBranch(ctx context.Context, r *Repo) (string, map[string]bool) {
+func (p *Pipeline) detectBranch(ctx context.Context, r *Repo) (string, map[string]string) {
 	// Branch choice depends only on origin, so a resolved branch is stable across
 	// the two inspect passes and the warning is reported once.
 	if p.cfg.Branch == "" && r.branchDetected {
@@ -423,7 +483,7 @@ func (p *Pipeline) detectBranch(ctx context.Context, r *Repo) (string, map[strin
 	if p.cfg.Branch != "" {
 		// An explicit --branch is trusted even when origin is unreachable, but a
 		// known-existing remote must still contain it.
-		if remote == nil || remote[p.cfg.Branch] {
+		if remote == nil || remote[p.cfg.Branch] != "" {
 			return p.cfg.Branch, remote
 		}
 		p.journal.logf("  ! %s: --branch %s is not on origin", r.Name, p.cfg.Branch)
@@ -432,19 +492,19 @@ func (p *Pipeline) detectBranch(ctx context.Context, r *Repo) (string, map[strin
 
 	if out, err := p.exec.Quiet(ctx, r.Path, "git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"); err == nil {
 		name := strings.TrimPrefix(out, "origin/")
-		if remote == nil || remote[name] {
+		if remote == nil || remote[name] != "" {
 			return name, remote
 		}
 		p.journal.logf("  ! %s: origin/HEAD points at %s, which is not on origin; ignoring it", r.Name, name)
 	}
 	for _, c := range []string{"main", "master", "trunk"} {
-		if remote[c] {
+		if remote[c] != "" {
 			return c, remote
 		}
 	}
 	// Nothing conventional: fall back to the checked-out branch only if origin has it.
 	if cur, err := p.exec.Quiet(ctx, r.Path, "git", "rev-parse", "--abbrev-ref", "HEAD"); err == nil &&
-		cur != "" && cur != "HEAD" && remote[cur] {
+		cur != "" && cur != "HEAD" && remote[cur] != "" {
 		p.journal.logf("  ! %s: no main/master/trunk on origin; using checked-out branch %s", r.Name, cur)
 		return cur, remote
 	}
@@ -537,6 +597,77 @@ func (p *Pipeline) tagLocations(ctx context.Context, r *Repo) (local, remote str
 		}
 	}
 	return local, remote
+}
+
+// pushUnpushed publishes local-only commits on each repository's branch to origin
+// *before* any go.mod is rewritten. go get resolves a dependency by commit over the
+// network, so a peer with unpushed work would otherwise be pinned to the older
+// commit origin does have -- silently dropping that work from the release. Pushing
+// first makes the tip we pin to the tip that is actually on the remote.
+//
+// It pushes the local branch ref (refs/heads/<branch>), never HEAD, so a checked-out
+// feature branch is not leaked onto the release branch. Divergence (local commits
+// plus missing origin commits) is refused rather than force-pushed over; a force
+// push would rewrite shared history.
+func (p *Pipeline) pushUnpushed(ctx context.Context) error {
+	if p.readOnly {
+		return nil
+	}
+	// Nothing to do unless some repository is ahead of origin.
+	var pending []*Repo
+	for _, name := range p.scan.workOrder() {
+		if r := p.scan.Repos[name]; r.Ahead > 0 {
+			pending = append(pending, r)
+		}
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+	p.step("Publishing unpushed commits before bumping")
+
+	// Classify before publishing anything: a diverged repository must stop the whole
+	// run, not be discovered after other repositories were already pushed.
+	var blocked []string
+	for _, r := range pending {
+		switch {
+		case r.Behind > 0:
+			blocked = append(blocked, fmt.Sprintf("%s: %d local commit(s) and %d behind origin/%s (diverged)", r.Name, r.Ahead, r.Behind, r.Branch))
+		case !r.RemoteBranch:
+			blocked = append(blocked, fmt.Sprintf("%s: %d local commit(s) but %s is not on origin", r.Name, r.Ahead, r.Branch))
+		}
+	}
+	if len(blocked) > 0 {
+		if p.cfg.DryRun {
+			p.journal.logf("  ! would refuse to bump: %s", strings.Join(blocked, "; "))
+			p.journal.logf("    reconcile those repositories (pull --rebase, or push the branch to origin) before a real release")
+			return nil
+		}
+		return fmt.Errorf("local commits cannot be published before bumping; reconcile each repository first (pull --rebase, or push its branch to origin):\n  %s",
+			strings.Join(blocked, "\n  "))
+	}
+
+	for _, r := range pending {
+		if p.cfg.DryRun {
+			p.journal.logf("  (dry run) would push %d local commit(s) in %s to origin/%s", r.Ahead, r.Name, r.Branch)
+			continue
+		}
+		if !p.cfg.Push {
+			// The user asked not to publish anything. We cannot make the unpushed tip
+			// resolvable, so pin dependents to the origin tip and say plainly that this
+			// repository's local work is excluded.
+			p.journal.logf("  ! %s: %d local commit(s) not on origin and --push=false; dependents pin to origin/%s@%s, excluding them",
+				r.Name, r.Ahead, r.Branch, short(r.Tip))
+			continue
+		}
+		if _, err := p.exec.Run(ctx, r.Path, false, "git", "push", "origin", "refs/heads/"+r.Branch+":"+r.Branch); err != nil {
+			return fmt.Errorf("%s: pushing %d local commit(s) to origin/%s: %w", r.Name, r.Ahead, r.Branch, err)
+		}
+		// origin now holds the local tip; pin dependents to it so their go.get resolves
+		// the commit that includes this repository's work.
+		r.Tip = r.LocalTip
+		p.journal.logf("  %s: pushed %d local commit(s) to origin/%s (%s)", r.Name, r.Ahead, r.Branch, short(r.Tip))
+	}
+	return nil
 }
 
 // bumpToTip points every in-namespace dependency at the tip of its default branch.
@@ -920,6 +1051,15 @@ func short(hash string) string {
 		return hash[:8]
 	}
 	return hash
+}
+
+// atoiDefault parses a count printed by `git rev-list --count`, falling back to def.
+func atoiDefault(s string, def int) int {
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil {
+		return def
+	}
+	return n
 }
 
 // where describes which side an existing tag was found on.

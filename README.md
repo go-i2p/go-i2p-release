@@ -110,28 +110,39 @@ are still honoured.
    listed and skipped rather than aborting the run; a repository from the known
    release set that is not a checkout is a hard error instead.
 4. **Sync** — fast-forwards clean working trees onto their tip.
-5. **Bump** — snapshots each module's `go.mod`/`go.sum`, drops local `replace`
+5. **Publish unpushed commits** — before any `go.mod` is rewritten, each
+   repository's local branch is compared to origin and any commits origin does not
+   have are pushed. `go get <peer>@<hash>` resolves a commit over the network, so a
+   dependency with unpushed work would otherwise be pinned to the older commit
+   origin does have — silently dropping that work from the release. It pushes the
+   branch ref (`refs/heads/<branch>`), never `HEAD`, so a checked-out feature
+   branch is not leaked onto the release branch. A branch that has diverged (local
+   commits *and* missing origin commits) is refused rather than force-pushed over,
+   because a force push would rewrite shared history. With `--push=false` the
+   unpushed work cannot be made resolvable, so the run says so and pins to the
+   origin tip, excluding it.
+6. **Bump** — snapshots each module's `go.mod`/`go.sum`, drops local `replace`
    directives, then `go get`s each in-namespace dependency at its origin tip and
    runs `go mod tidy`. If a dependency cannot be resolved, that module is restored
    to its snapshot and the run stops, so a failed `go get` never leaves a dropped
    replace behind.
-6. **Verify** — `go build ./...`, and `go test ./...` by default. On failure every
+7. **Verify** — `go build ./...`, and `go test ./...` by default. On failure every
    module rewritten by this pass is restored from its snapshot and the run stops
    before anything is committed or pushed, so a broken tip never reaches the shared
    namespace and no `go.mod` is left pointing at an unreachable revision.
-7. **Check in** — stages and commits only the module files that actually changed,
+8. **Check in** — stages and commits only the module files that actually changed,
    by explicit pathspec, so a missing `go.sum` cannot fail the add atomically and a
    pre-staged unrelated file is never swept into the dependency commit.
-8. **Push** — publishes each repository's default branch, skipping any whose branch
+9. **Push** — publishes each repository's default branch, skipping any whose branch
    cannot be confirmed on origin (so a stale `origin/HEAD` never creates a phantom
    branch).
-9. **Tag** (release only) — creates an annotated tag in every repository and pushes
+10. **Tag** (release only) — creates an annotated tag in every repository and pushes
    it. Existing tags are checked *before* any work begins — on the host via
    `git ls-remote`, not just local refs, since `git fetch` does not populate
    remote-tracking refs for tags — so a collision aborts with nothing changed. A
    `v2+` version is always refused because the namespace has no `/vN` module paths,
    whatever `--tag-existing` says.
-10. **Post-tag bump** (`--post-tag-bump`) — rewrites dependencies from
+11. **Post-tag bump** (`--post-tag-bump`) — rewrites dependencies from
     pseudo-versions to the new tag, verifies, checks in and pushes again, so the
     released tree references releases rather than commits.
 
@@ -142,6 +153,10 @@ are still honoured.
   fails, those files are restored and nothing is committed, tagged or pushed. A
   broken or unreachable tip can never be checked in, and a dropped `replace` is never
   left behind.
+- **Unpushed commits are published before they are pinned.** Each repository's
+  branch is compared to origin and local-only commits are pushed before any
+  `go.mod` references them, so a dependency's unpushed work is never silently
+  dropped from the release. Diverged branches are refused, not force-pushed.
 - **Bumping targets the origin tip, not local `HEAD`.** `go get` resolves commits
   over the network, so an unpushed local commit would fail to fetch.
 - **`--standalone` (default) sets `GOWORK=off`.** A `go.work` in the namespace

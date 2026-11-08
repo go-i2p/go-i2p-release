@@ -101,10 +101,11 @@ are still honoured.
 2. **Order** — topologically sorts that graph so a dependency always precedes its
    dependents. The layer table below is only a tie-breaker, so the order follows
    what the modules actually require rather than a hand-maintained list.
-3. **Inspect** — detects each repository's default branch (from `origin/HEAD`,
-   falling back to the checked-out branch, then `main`/`master`/`trunk`), fetches
+3. **Inspect** — detects each repository's default branch (`origin/HEAD` when origin
+   confirms it, else `main`/`master`/`trunk`, else the checked-out branch), fetches
    origin, records the tip, and refuses to run on tracked local changes unless
-   `--allow-dirty` is passed. Untracked files never block a run.
+   `--allow-dirty` is passed. Untracked files never block a run. `plan` is strictly
+   read-only: it never checks out, merges, commits or pushes.
 4. **Sync** — fast-forwards clean working trees onto their tip.
 5. **Bump** — drops local `replace` directives, then `go get`s each in-namespace
    dependency at its origin tip and runs `go mod tidy`.
@@ -134,6 +135,13 @@ are still honoured.
 - **Major versions are preflighted.** A `v2+` tag requires a `/vN` module path in
   every repository, which this namespace does not use; the run stops before pushing
   anything rather than leaving tags that cannot be required.
+- **The push target is confirmed, never guessed.** `origin/HEAD` is a local symbolic
+  ref and can be stale — in `go-i2p` it names `master` while origin only has `main`.
+  A branch is used only when `git ls-remote` confirms it exists on origin; otherwise
+  the run refuses rather than creating a new branch from the wrong work. The resolved
+  remote URL is logged before pushing.
+- **Only repositories this run committed are pushed.** A repository with nothing of
+  ours to publish is skipped rather than having unrelated local work pushed.
 - **A run reports every failing command.** The exit message lists the concrete
   `git`/`go` invocations that broke, not just a headline error.
 - Interrupting with Ctrl-C cancels in-flight commands instead of orphaning them.

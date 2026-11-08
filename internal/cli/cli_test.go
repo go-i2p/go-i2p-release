@@ -176,6 +176,44 @@ func TestQuietIgnoresStderr(t *testing.T) {
 	}
 }
 
+// TestStaleOriginHeadIsIgnored guards the hazard that caused a bad push: a local
+// origin/HEAD naming a branch that is not on the remote. Selecting it would create a
+// new branch on the remote from the wrong work.
+func TestStaleOriginHeadIsIgnored(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	cfg := Defaults()
+	cfg.Namespace = dir
+	j := NewJournal(io.Discard)
+	ex := NewExecutor(cfg, j)
+	q := func(args ...string) {
+		if _, err := ex.Quiet(ctx, dir, args...); err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+	}
+	q("git", "init", "--quiet", ".")
+	q("git", "config", "user.email", "t@example.com")
+	q("git", "config", "user.name", "t")
+	q("git", "commit", "-q", "--allow-empty", "-m", "seed")
+	q("git", "branch", "-M", "main")
+	// A bare "origin" that only carries main.
+	q("git", "init", "--quiet", "--bare", "../origin.git")
+	q("git", "remote", "add", "origin", "../origin.git")
+	q("git", "push", "-q", "origin", "main")
+	q("git", "fetch", "-q", "origin")
+	// Point origin/HEAD at a branch that does not exist on origin.
+	q("git", "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/master")
+
+	p := NewPipeline(cfg, &Scan{Repos: map[string]*Repo{"x": {Name: "x", Path: dir}}, Order: []string{"x"}}, j)
+	branch, _ := p.detectBranch(ctx, p.scan.Repos["x"])
+	if branch != "main" {
+		t.Errorf("detectBranch() = %q, want main (stale origin/HEAD must be ignored)", branch)
+	}
+	if p.scan.Repos["x"].RemoteBranch && branch == "master" {
+		t.Error("must not treat a branch absent from origin as usable")
+	}
+}
+
 func TestDefaultsNamespaceUsesGopath(t *testing.T) {
 	t.Setenv("GOPATH", "/custom/gopath")
 	ns, err := DefaultNamespace()

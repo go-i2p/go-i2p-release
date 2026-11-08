@@ -665,7 +665,10 @@ func (p *Pipeline) Summary(start time.Time) string {
 	if len(fails) > 0 {
 		lines = append(lines, fmt.Sprintf("  first failure: %s", fails[0]))
 	}
-	if p.cfg.DryRun {
+	switch {
+	case p.readOnly:
+		// plan inspects only; the dry-run note would be misleading.
+	case p.cfg.DryRun:
 		lines = append(lines, "  dry run: re-run with --dry-run=false to apply")
 	}
 	return strings.Join(lines, "\n")

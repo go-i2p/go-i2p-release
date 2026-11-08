@@ -28,7 +28,13 @@ func Execute(appVersion string) int {
 	ctx, stop := signalContext()
 	defer stop()
 
-	if err := newRootCmd(appVersion).ExecuteContext(ctx); err != nil {
+	err := newRootCmd(appVersion).ExecuteContext(ctx)
+	if err != nil && ctx.Err() != nil {
+		// The user interrupted: a failure the run happened to record first must not
+		// mask the cancellation, which has its own exit code.
+		err = context.Canceled
+	}
+	if err != nil {
 		return reportError(err)
 	}
 	return 0
@@ -37,6 +43,12 @@ func Execute(appVersion string) int {
 // reportError prints an error, expanding the failing commands a run collected, and
 // maps them onto an exit code.
 func reportError(err error) int {
+	// Check cancellation first: a chained error may carry a context cause, and an
+	// interrupt should read as 130 rather than a generic failure.
+	if errors.Is(err, context.Canceled) {
+		fmt.Fprintln(os.Stderr, "cancelled")
+		return 130
+	}
 	var ce *chainError
 	if errors.As(err, &ce) {
 		fmt.Fprintf(os.Stderr, "error: %s\n", ce.Error())
@@ -44,10 +56,6 @@ func reportError(err error) int {
 			fmt.Fprintf(os.Stderr, "  caused by: %s\n", c)
 		}
 		return 1
-	}
-	if errors.Is(err, context.Canceled) {
-		fmt.Fprintln(os.Stderr, "cancelled")
-		return 130
 	}
 	fmt.Fprintf(os.Stderr, "error: %s\n", err)
 	return 1
@@ -61,6 +69,11 @@ type chainError struct {
 }
 
 func (e *chainError) Error() string { return e.msg }
+
+// Unwrap exposes the causes so errors.Is still sees a context cancellation that
+// arrived after an earlier failure. Without it, Ctrl-C during a run whose journal
+// already held a failed command would exit 1 instead of 130.
+func (e *chainError) Unwrap() []error { return e.causes }
 
 // wrapWithCauses enriches err with the journal's failed commands, if any.
 func wrapWithCauses(err error, journal *Journal) error {
@@ -287,6 +300,7 @@ func prepare(cmd *cobra.Command, mode, version string) (*Pipeline, *Journal, *Co
 		return nil, nil, nil, err
 	}
 	j := NewJournal(cmd.OutOrStdout())
+	j.SetQuiet(cfg.Quiet)
 	p := NewPipeline(cfg, scan, j)
 	if mode == modeCheck {
 		p.SetReadOnly()

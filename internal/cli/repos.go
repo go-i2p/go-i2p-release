@@ -66,6 +66,12 @@ type Repo struct {
 	// Deps are namespace peers this module requires, by repository name.
 	Deps []string
 
+	// IsRepo is false when the directory holds a go.mod but no git metadata. Such
+	// modules are listed by the plan but dropped from the mutating steps.
+	IsRepo bool
+	// SkipReason explains why a repository was excluded from the mutating steps.
+	SkipReason string
+
 	// Detected while inspecting.
 	Branch  string // default branch of the repository
 	Current string // branch actually checked out
@@ -83,6 +89,13 @@ type Repo struct {
 	// stale origin/HEAD can name a branch that is not on the remote at all, and
 	// pushing to it would silently create one.
 	RemoteBranch bool
+
+	// Snapshot holds the pre-bump go.mod/go.sum so a failed run can be unwound.
+	// Set by the bump steps before they touch the working tree.
+	Snapshot *modSnapshot
+	// BumpFailed records that this module could not be moved to its tips; its
+	// snapshot is restored and it is left out of the commit and push.
+	BumpFailed bool
 
 	// remotes caches the branch names seen on origin so detection is one ls-remote;
 	// branchDetected stops the choice (and its warnings) being recomputed.
@@ -113,9 +126,12 @@ func Discover(cfg *Config) (*Scan, error) {
 	scan := &Scan{Repos: map[string]*Repo{}, Prefix: cfg.Prefix}
 	for _, name := range sel {
 		path := filepath.Join(cfg.Namespace, name)
-		r := &Repo{Name: name, Path: path}
+		r := &Repo{Name: name, Path: path, IsRepo: hasGitMetadata(path)}
 		module, deps, warns := readModule(filepath.Join(path, "go.mod"), cfg.Prefix)
 		r.Module, r.Deps, r.Warnings = module, deps, warns
+		if !r.IsRepo {
+			r.SkipReason = "not a git repository"
+		}
 		if module != "" && module != cfg.Prefix+"/"+name {
 			r.Warnings = append(r.Warnings, fmt.Sprintf("module path %q does not match %s/%s; using the path declared in go.mod",
 				module, cfg.Prefix, name))
@@ -193,6 +209,14 @@ func hasGoMod(dir string) bool {
 	return err == nil && !info.IsDir()
 }
 
+// hasGitMetadata reports whether dir looks like a git checkout. It is a cheap
+// filesystem probe so discovery can flag non-repository modules before any git
+// command runs.
+func hasGitMetadata(dir string) bool {
+	_, err := os.Stat(filepath.Join(dir, ".git"))
+	return err == nil
+}
+
 // selectNames applies --only/--exclude/--libs/--clients to the candidate list.
 func selectNames(cfg *Config, candidates []string) []string {
 	available := map[string]bool{}
@@ -211,12 +235,21 @@ func selectNames(cfg *Config, candidates []string) []string {
 			return false
 		}
 		layer := layerOf(name)
-		unknown := layer == -1
-		if cfg.Libs && !unknown && layer >= ClientLayer {
-			return false
-		}
-		if cfg.Clients && !unknown && layer < ClientLayer {
-			return false
+		// --libs/--clients are applied to every candidate, including one named
+		// explicitly by --only, so `--libs --only i2ptui` cannot quietly release an
+		// application. A module outside the known layers has no verifiable layer, so
+		// a layer filter drops it with a warning rather than assuming it qualifies.
+		if cfg.Libs || cfg.Clients {
+			if layer == -1 {
+				cfg.Warnf("%s is not in the known layer list, so --libs/--clients cannot classify it; excluded", name)
+				return false
+			}
+			if cfg.Libs && layer >= ClientLayer {
+				return false
+			}
+			if cfg.Clients && layer < ClientLayer {
+				return false
+			}
 		}
 		return true
 	}

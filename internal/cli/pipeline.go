@@ -1,8 +1,11 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -108,6 +111,9 @@ func (p *Pipeline) inspect(ctx context.Context) error {
 	// even in a dry run; the plan should reflect what origin actually holds.
 	for _, name := range p.scan.Order {
 		r := p.scan.Repos[name]
+		if r.SkipReason != "" {
+			continue
+		}
 		if p.cfg.Sync {
 			if _, err := p.exec.Run(ctx, r.Path, true, "git", "fetch", "--prune", "origin"); err != nil {
 				p.journal.logf("  ! %s: fetch failed: %v", name, err)
@@ -121,6 +127,9 @@ func (p *Pipeline) inspect(ctx context.Context) error {
 	// Pass 2: move clean trees onto their tip, then re-read.
 	for _, name := range p.scan.Order {
 		r := p.scan.Repos[name]
+		if r.SkipReason != "" {
+			continue
+		}
 		if p.cfg.Sync && !r.Dirty {
 			p.syncWorktree(ctx, r)
 			if err := p.readState(ctx, r); err != nil {
@@ -129,9 +138,14 @@ func (p *Pipeline) inspect(ctx context.Context) error {
 		}
 	}
 
-	var dirty, behind, mismatched, unresolved []string
+	var dirty, behind, mismatched, unresolved, skipped []string
 	for _, name := range p.scan.Order {
 		r := p.scan.Repos[name]
+		if r.SkipReason != "" {
+			skipped = append(skipped, fmt.Sprintf("%s (%s)", name, r.SkipReason))
+			p.journal.logf("  %-16s %-8s %s  (skipped: %s)", name, "-", "-", r.SkipReason)
+			continue
+		}
 		if !r.RemoteBranch {
 			unresolved = append(unresolved, name)
 		}
@@ -173,6 +187,11 @@ func (p *Pipeline) inspect(ctx context.Context) error {
 	// Report structural findings before failing, so a cycle warning is not hidden
 	// behind a dirty-tree error.
 	p.printScanWarnings()
+
+	if len(skipped) > 0 {
+		p.journal.logf("  ! skipped (no git metadata): %s", strings.Join(skipped, ", "))
+		p.journal.logf("    those modules are listed but never bumped, committed or tagged; run them from a real checkout")
+	}
 
 	if len(unresolved) > 0 {
 		p.journal.logf("  ! no default branch could be confirmed on origin for: %s", strings.Join(unresolved, ", "))
@@ -216,6 +235,18 @@ func (p *Pipeline) inspect(ctx context.Context) error {
 	return nil
 }
 
+// workOrder returns the release order with skipped modules removed, so the
+// mutating steps never touch a directory that is not a checkout.
+func (p *Pipeline) workOrder() []string {
+	var out []string
+	for _, name := range p.scan.Order {
+		if p.scan.Repos[name].SkipReason == "" {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
 // printScanWarnings reports discovery-level notes such as a dependency cycle.
 func (p *Pipeline) printScanWarnings() {
 	for _, w := range p.scan.Warnings {
@@ -223,12 +254,77 @@ func (p *Pipeline) printScanWarnings() {
 	}
 }
 
+// modSnapshot holds the pre-bump contents of a repository's go.mod and go.sum, so
+// a run that fails verification can put the tree back the way it found it.
+type modSnapshot struct {
+	// Names is the tracked path names in a stable order.
+	Names []string
+	Files map[string][]byte
+	// HadFile records which paths existed before the bump, including those whose
+	// content was empty, so a restore does not delete what it did not create.
+	HadFile map[string]bool
+}
+
+// modFileNames are the files a dependency bump rewrites.
+var modFileNames = []string{"go.mod", "go.sum"}
+
+// snapshotFiles reads the module files from dir. Missing files are not an error:
+// a module legitimately may have no go.sum.
+func snapshotFiles(dir string) (*modSnapshot, error) {
+	s := &modSnapshot{Names: modFileNames, Files: map[string][]byte{}, HadFile: map[string]bool{}}
+	for _, name := range modFileNames {
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		s.Files[name] = data
+		s.HadFile[name] = true
+	}
+	return s, nil
+}
+
+// restore puts the module files back exactly as recorded, deleting any that did not
+// exist before. It returns the paths it touched.
+func (s *modSnapshot) restore(dir string) []string {
+	var touched []string
+	for _, name := range s.Names {
+		path := filepath.Join(dir, name)
+		if !s.HadFile[name] {
+			if _, err := os.Stat(path); err == nil {
+				if os.Remove(path) == nil {
+					touched = append(touched, name)
+				}
+			}
+			continue
+		}
+		cur, err := os.ReadFile(path)
+		if err == nil && bytes.Equal(cur, s.Files[name]) {
+			continue
+		}
+		if os.WriteFile(path, s.Files[name], 0o644) == nil {
+			touched = append(touched, name)
+		}
+	}
+	return touched
+}
+
 // readState records the branch, HEAD, origin tip and dirty flag of a repository.
 func (p *Pipeline) readState(ctx context.Context, r *Repo) error {
 	head, err := p.exec.Quiet(ctx, r.Path, "git", "rev-parse", "HEAD")
 	if err != nil {
+		if !r.IsRepo {
+			// Discovered by --all or --only: a module directory that is not a
+			// checkout. It cannot be bumped or committed, so mark it and move on
+			// rather than failing the whole namespace run.
+			r.SkipReason = "not a git repository"
+			return nil
+		}
 		return fmt.Errorf("%s: cannot read HEAD in %s: %w", r.Name, r.Path, err)
 	}
+	r.IsRepo = true
 	r.Head = head
 	branch, remote := p.detectBranch(ctx, r)
 	r.branchDetected = true
@@ -355,43 +451,55 @@ func (p *Pipeline) detectBranch(ctx context.Context, r *Repo) (string, map[strin
 	return "", remote
 }
 
-// plan prints the resolved release set and what would change.
+// plan prints the resolved release set and what would change. The table is the
+// command's deliverable, so it is written with printf and survives --quiet; the
+// surrounding commentary is suppressed by it.
 func (p *Pipeline) plan() {
 	p.step("Release plan")
-	p.journal.logf("%-16s %-8s %-9s %s", "REPOSITORY", "BRANCH", "TIP", "IN-NAMESPACE DEPENDENCIES")
+	p.journal.printf("%-16s %-8s %-9s %s", "REPOSITORY", "BRANCH", "TIP", "IN-NAMESPACE DEPENDENCIES")
 	for _, name := range p.scan.Order {
 		r := p.scan.Repos[name]
 		deps := "-"
 		if len(r.Deps) > 0 {
 			deps = strings.Join(r.Deps, ", ")
 		}
-		p.journal.logf("%-16s %-8s %-9s %s", name, r.Branch, short(r.Tip), deps)
+		status := ""
+		if r.SkipReason != "" {
+			status = "  (skipped: " + r.SkipReason + ")"
+		}
+		p.journal.printf("%-16s %-8s %-9s %s%s", name, r.Branch, short(r.Tip), deps, status)
 	}
 	if p.cfg.Version != "" {
-		p.journal.logf("\ntag: %s (policy for existing tags: %s)", p.cfg.Version, p.cfg.TagExisting)
+		p.journal.printf("\ntag: %s (policy for existing tags: %s)", p.cfg.Version, p.cfg.TagExisting)
 	}
-	p.journal.logf("verify: %s, push: %v, dry-run: %v, sync: %v, standalone: %v, private: %v",
+	p.journal.printf("verify: %s, push: %v, dry-run: %v, sync: %v, standalone: %v, private: %v",
 		p.cfg.Verify, p.cfg.Push, p.cfg.DryRun, p.cfg.Sync, p.cfg.Standalone, p.cfg.Private)
+	if p.cfg.Push && !p.cfg.DryRun {
+		p.journal.printf("note: plan resolves each repository's state but commits and pushes nothing; run `tip` or `release` to apply.")
+	}
 }
 
 // preflightTags applies --tag-existing before any work is done, so a release that
 // cannot tag cleanly stops before it commits or pushes anything.
 func (p *Pipeline) preflightTags(ctx context.Context) error {
-	if p.cfg.TagExisting != tagFail {
-		return nil
-	}
 	// Namespace modules have no /vN path suffix, so a v2+ tag cannot be required by
-	// `go get`. Catch that here instead of after the tags are pushed.
+	// `go get`. This is fatal whatever --tag-existing says, so it is checked before
+	// the policy below is consulted.
 	if mj, err := strconv.Atoi(strings.TrimPrefix(semver.Major(p.cfg.Version), "v")); err == nil && mj >= 2 {
 		return fmt.Errorf("version %s requires a /v%d module path suffix in every repository (a semantic-import-versioning change this namespace does not use); release a v0.x or v1.x version instead",
 			p.cfg.Version, mj)
+	}
+	if p.cfg.TagExisting != tagFail {
+		return nil
 	}
 
 	var conflicts []string
 	for _, name := range p.scan.Order {
 		r := p.scan.Repos[name]
-		local, _ := p.exec.Quiet(ctx, r.Path, "git", "rev-parse", "--verify", "refs/tags/"+p.cfg.Version)
-		remote, _ := p.exec.Quiet(ctx, r.Path, "git", "rev-parse", "--verify", "refs/remotes/origin/"+p.cfg.Version)
+		if r.SkipReason != "" {
+			continue
+		}
+		local, remote := p.tagLocations(ctx, r)
 		if local != "" || remote != "" {
 			conflicts = append(conflicts, fmt.Sprintf("%s (%s)", name, where(local, remote)))
 		}
@@ -403,63 +511,155 @@ func (p *Pipeline) preflightTags(ctx context.Context) error {
 	return nil
 }
 
-// bumpToTip points every in-namespace dependency at the tip of its default branch.
-func (p *Pipeline) bumpToTip(ctx context.Context) error {
-	p.step("Bumping dependencies to branch tips")
-	for _, name := range p.scan.Order {
-		r := p.scan.Repos[name]
-		if len(r.Deps) == 0 {
-			continue
+// tagLocations reports where the release tag exists. The remote side is read with
+// ls-remote rather than refs/remotes/origin/<tag>: `git fetch` does not create
+// remote-tracking refs for tags, so probing that ref misses any tag that exists
+// only on the host and would be silently re-created and force-pushed over.
+func (p *Pipeline) tagLocations(ctx context.Context, r *Repo) (local, remote string) {
+	tagRef := "refs/tags/" + p.cfg.Version
+	if out, err := p.exec.Quiet(ctx, r.Path, "git", "rev-parse", "--verify", tagRef); err == nil {
+		local = out
+	}
+	out, err := p.exec.Quiet(ctx, r.Path, "git", "ls-remote", "--tags", "origin", tagRef)
+	if err != nil {
+		// origin unreachable: fall back to a remote-tracking ref if one happens to exist.
+		if t, terr := p.exec.Quiet(ctx, r.Path, "git", "rev-parse", "--verify", "refs/remotes/origin/"+p.cfg.Version); terr == nil {
+			remote = t
 		}
-		if !p.cfg.Quiet {
-			p.journal.logf("  %s: %s", name, strings.Join(r.Deps, ", "))
-		}
-		// Drop local replaces so the published graph matches what gets tagged.
-		for _, dep := range r.Deps {
-			peer := p.scan.Repos[dep]
-			if _, err := p.exec.Run(ctx, r.Path, false, "go", "mod", "edit", "-dropreplace="+p.moduleOf(peer)); err != nil {
-				p.journal.logf("    ! dropreplace %s in %s: %v", dep, name, err)
-			}
-		}
-		for _, dep := range r.Deps {
-			peer := p.scan.Repos[dep]
-			// Use the origin tip, not local HEAD: go get resolves the commit over the
-			// network, so an unpushed local commit would fail to fetch.
-			target := p.moduleOf(peer) + "@" + peer.Tip
-			if _, err := p.exec.Run(ctx, r.Path, false, "go", "get", target); err != nil {
-				p.journal.logf("    ! go get %s in %s: %v", target, name, err)
-			}
-		}
-		if _, err := p.exec.Run(ctx, r.Path, false, "go", "mod", "tidy"); err != nil {
-			p.journal.logf("    ! go mod tidy in %s: %v", name, err)
+		return local, remote
+	}
+	for _, line := range splitLines(out) {
+		fields := strings.Fields(line)
+		// Annotated tags produce both refs/tags/v and refs/tags/v^{}; take the plain one.
+		if len(fields) >= 2 && fields[1] == tagRef {
+			remote = fields[0]
+			break
 		}
 	}
-	return nil
+	return local, remote
+}
+
+// bumpToTip points every in-namespace dependency at the tip of its default branch.
+// Each repository's go.mod/go.sum are snapshotted first: if a dependency cannot be
+// resolved, the module is put back exactly as it was found and the run stops before
+// anything is committed, tagged or pushed. Without that, a failed `go get` would
+// leave the tree rewritten to a local replace that was just dropped -- the state
+// that makes a module unbuildable for everyone.
+func (p *Pipeline) bumpToTip(ctx context.Context) error {
+	p.step("Bumping dependencies to branch tips")
+	// Use the origin tip, not local HEAD: go get resolves the commit over the
+	// network, so an unpushed local commit would fail to fetch.
+	return p.bump(ctx, func(peer *Repo) string { return p.moduleOf(peer) + "@" + peer.Tip }, true)
 }
 
 // bumpToTag rewrites dependencies to use the release tag instead of a pseudo-version.
 func (p *Pipeline) bumpToTag(ctx context.Context) error {
 	p.step("Rewriting dependencies to " + p.cfg.Version)
-	for _, name := range p.scan.Order {
+	return p.bump(ctx, func(peer *Repo) string { return p.moduleOf(peer) + "@" + p.cfg.Version }, false)
+}
+
+// bump applies resolve() to each in-namespace dependency of every selected
+// repository. dropReplaces is used by the tip pass only: the tag pass follows a
+// successful tip pass, where the replaces are already gone.
+func (p *Pipeline) bump(ctx context.Context, resolve func(peer *Repo) string, dropReplaces bool) error {
+	var broken []string
+	for _, name := range p.workOrder() {
 		r := p.scan.Repos[name]
 		if len(r.Deps) == 0 {
 			continue
 		}
-		for _, dep := range r.Deps {
-			peer := p.scan.Repos[dep]
-			target := p.moduleOf(peer) + "@" + p.cfg.Version
-			if _, err := p.exec.Run(ctx, r.Path, false, "go", "get", target); err != nil {
-				p.journal.logf("    ! go get %s in %s: %v", target, name, err)
+		snap, err := snapshotFiles(r.Path)
+		if err != nil {
+			r.BumpFailed = true
+			broken = append(broken, fmt.Sprintf("%s: %v", name, err))
+			continue
+		}
+		r.Snapshot = snap
+
+		// A dependency with no resolvable tip (skipped, or never pushed) must not
+		// rewrite this module at all, so check before editing anything.
+		if unresolvable := p.unresolvedDeps(r); unresolvable != "" {
+			p.journal.logf("  ! %s: cannot resolve %s; leaving it unchanged", name, unresolvable)
+			r.BumpFailed = true
+			broken = append(broken, fmt.Sprintf("%s (dependency %s)", name, unresolvable))
+			continue
+		}
+
+		if !p.cfg.Quiet {
+			p.journal.logf("  %s: %s", name, strings.Join(r.Deps, ", "))
+		}
+		// Drop local replaces so the published graph matches what gets tagged.
+		if dropReplaces {
+			for _, dep := range r.Deps {
+				peer := p.scan.Repos[dep]
+				if _, err := p.exec.Run(ctx, r.Path, false, "go", "mod", "edit", "-dropreplace="+p.moduleOf(peer)); err != nil {
+					p.journal.logf("    ! dropreplace %s in %s: %v", dep, name, err)
+					r.BumpFailed = true
+					break
+				}
 			}
 		}
-		if _, err := p.exec.Run(ctx, r.Path, false, "go", "mod", "tidy"); err != nil {
-			p.journal.logf("    ! go mod tidy in %s: %v", name, err)
+		for _, dep := range r.Deps {
+			if r.BumpFailed {
+				break
+			}
+			peer := p.scan.Repos[dep]
+			target := resolve(peer)
+			if _, err := p.exec.Run(ctx, r.Path, false, "go", "get", target); err != nil {
+				p.journal.logf("    ! go get %s in %s: %v", target, name, err)
+				r.BumpFailed = true
+			}
 		}
+		if !r.BumpFailed {
+			if _, err := p.exec.Run(ctx, r.Path, false, "go", "mod", "tidy"); err != nil {
+				p.journal.logf("    ! go mod tidy in %s: %v", name, err)
+				r.BumpFailed = true
+			}
+		}
+		if r.BumpFailed {
+			p.restore(r)
+			broken = append(broken, name)
+		}
+	}
+	if len(broken) > 0 {
+		return fmt.Errorf("could not update dependencies for %s; their go.mod/go.sum were restored and nothing was committed, tagged or pushed",
+			strings.Join(broken, ", "))
 	}
 	return nil
 }
 
-// verify builds and optionally tests each module after the bumps.
+// unresolvedDeps names the dependencies of r that cannot be reached over origin.
+func (p *Pipeline) unresolvedDeps(r *Repo) string {
+	var missing []string
+	for _, dep := range r.Deps {
+		peer, ok := p.scan.Repos[dep]
+		if !ok || peer.SkipReason != "" || peer.Tip == "" {
+			missing = append(missing, dep)
+		}
+	}
+	return strings.Join(missing, ", ")
+}
+
+// restore puts a repository's module files back the way they were found.
+func (p *Pipeline) restore(r *Repo) {
+	if r.Snapshot == nil {
+		return
+	}
+	if touched := r.Snapshot.restore(r.Path); len(touched) > 0 && !p.cfg.Quiet {
+		p.journal.logf("    restored %s in %s", strings.Join(touched, " and "), r.Name)
+	}
+}
+
+// restoreAll unwinds every snapshot taken by the current pass.
+func (p *Pipeline) restoreAll() {
+	for _, name := range p.workOrder() {
+		p.restore(p.scan.Repos[name])
+	}
+}
+
+// verify builds and optionally tests each module after the bumps. On failure it
+// restores every go.mod/go.sum the run rewrote, so a broken tip never lands in a
+// committed or pushed form.
 func (p *Pipeline) verify(ctx context.Context) error {
 	if p.cfg.Verify == verifyNone {
 		return nil
@@ -479,7 +679,7 @@ func (p *Pipeline) verify(ctx context.Context) error {
 	}
 	p.step("Verifying modules with " + label)
 	var failed []string
-	for _, name := range p.scan.Order {
+	for _, name := range p.workOrder() {
 		r := p.scan.Repos[name]
 		if _, err := p.exec.Run(ctx, r.Path, false, "go", "build", "./..."); err != nil {
 			failed = append(failed, name+" (build)")
@@ -498,7 +698,9 @@ func (p *Pipeline) verify(ctx context.Context) error {
 		}
 	}
 	if len(failed) > 0 {
-		return fmt.Errorf("verification failed for %s; nothing was committed or tagged", strings.Join(failed, ", "))
+		p.restoreAll()
+		return fmt.Errorf("verification failed for %s; the go.mod/go.sum this run rewrote were restored, so nothing was committed or tagged",
+			strings.Join(failed, ", "))
 	}
 	return nil
 }
@@ -507,8 +709,12 @@ func (p *Pipeline) verify(ctx context.Context) error {
 func (p *Pipeline) checkIn(ctx context.Context, message string) error {
 	p.step("Checking in dependency updates")
 	changed := 0
-	for _, name := range p.scan.Order {
+	for _, name := range p.workOrder() {
 		r := p.scan.Repos[name]
+		if r.BumpFailed {
+			p.journal.logf("  %s: skipped (dependency update failed)", name)
+			continue
+		}
 		out, err := p.exec.Quiet(ctx, r.Path, "git", "status", "--porcelain", "--", "go.mod", "go.sum")
 		if err != nil {
 			p.journal.logf("  ! %s: git status: %v", name, err)
@@ -520,13 +726,23 @@ func (p *Pipeline) checkIn(ctx context.Context, message string) error {
 			}
 			continue
 		}
+		paths := changedModFiles(out)
+		if len(paths) == 0 {
+			continue
+		}
 		changed++
 		r.HasPendingCommit = true
-		p.journal.logf("  %s: commit go.mod/go.sum (%s)", name, strings.Join(strings.Fields(out), " "))
-		if _, err := p.exec.Run(ctx, r.Path, false, "git", "add", "go.mod", "go.sum"); err != nil {
+		p.journal.logf("  %s: commit %s", name, strings.Join(paths, "/"))
+		// Stage and commit by explicit pathspec: a bare `git add go.mod go.sum` fails
+		// atomically when go.sum is absent, and a bare `git commit` would then commit
+		// whatever the user had already staged for a different change.
+		add := append([]string{"git", "add", "--"}, paths...)
+		if _, err := p.exec.Run(ctx, r.Path, false, add...); err != nil {
 			p.journal.logf("    ! git add %s: %v", name, err)
+			continue
 		}
-		if _, err := p.exec.Run(ctx, r.Path, false, "git", "commit", "-m", message); err != nil {
+		commit := append([]string{"git", "commit", "-m", message, "--"}, paths...)
+		if _, err := p.exec.Run(ctx, r.Path, false, commit...); err != nil {
 			p.journal.logf("    ! git commit %s: %v", name, err)
 		}
 	}
@@ -536,15 +752,36 @@ func (p *Pipeline) checkIn(ctx context.Context, message string) error {
 	return nil
 }
 
+// changedModFiles lists the module files a `git status --porcelain -- go.mod go.sum`
+// reports as changed. Only those are staged, so a missing go.sum cannot make the
+// whole `git add` fail.
+func changedModFiles(status string) []string {
+	var out []string
+	for _, line := range splitLines(status) {
+		if len(line) < 4 {
+			continue
+		}
+		path := strings.TrimSpace(line[2:])
+		// A rename or copy is reported as "old -> new"; the module files we care
+		// about are on the right.
+		if i := strings.LastIndex(path, " -> "); i >= 0 {
+			path = path[i+4:]
+		}
+		if path == "go.mod" || path == "go.sum" {
+			out = append(out, path)
+		}
+	}
+	return out
+}
+
 // tag creates the annotated release tag in every repository.
 // tag creates the annotated release tag in every repository. It runs after
 // checkIn, so the tag lands on the dependency commit rather than the pre-bump one.
 func (p *Pipeline) tag(ctx context.Context) error {
 	p.step("Tagging repositories " + p.cfg.Version)
-	for _, name := range p.scan.Order {
+	for _, name := range p.workOrder() {
 		r := p.scan.Repos[name]
-		local, _ := p.exec.Quiet(ctx, r.Path, "git", "rev-parse", "--verify", "refs/tags/"+p.cfg.Version)
-		remote, _ := p.exec.Quiet(ctx, r.Path, "git", "rev-parse", "--verify", "refs/remotes/origin/"+p.cfg.Version)
+		local, remote := p.tagLocations(ctx, r)
 		if local != "" || remote != "" {
 			switch p.cfg.TagExisting {
 			case tagSkip:
@@ -585,7 +822,7 @@ func (p *Pipeline) publish(ctx context.Context, withTag bool) error {
 	// Show the actual destination before publishing: a namespace copied elsewhere,
 	// or a repository whose remote was re-pointed, should be visible in the log.
 	targets := map[string]string{}
-	for _, name := range p.scan.Order {
+	for _, name := range p.workOrder() {
 		r := p.scan.Repos[name]
 		if url, err := p.exec.Quiet(ctx, r.Path, "git", "remote", "get-url", "origin"); err == nil {
 			targets[name] = url
@@ -602,15 +839,19 @@ func (p *Pipeline) publish(ctx context.Context, withTag bool) error {
 			}
 		} else {
 			p.journal.logf("  remotes differ per repository; verify before publishing:")
-			for _, name := range p.scan.Order {
+			for _, name := range p.workOrder() {
 				if u, ok := targets[name]; ok {
 					p.journal.logf("    %-16s %s", name, u)
 				}
 			}
 		}
 	}
-	for _, name := range p.scan.Order {
+	for _, name := range p.workOrder() {
 		r := p.scan.Repos[name]
+		if r.BumpFailed {
+			p.journal.logf("  ! %s: skipping push; dependency update failed", name)
+			continue
+		}
 		// Pushing an unconfirmed branch would create it on the remote, which is how a
 		// stale origin/HEAD turns into a bogus new branch.
 		if !r.RemoteBranch {

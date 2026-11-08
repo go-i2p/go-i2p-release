@@ -103,7 +103,22 @@ func (c *Config) Warnings() []string { return c.warnings }
 // keys can supply the same values. Flags that were not explicitly set fall through
 // to env, then file, then the flag's own default.
 func BindFlags(flags *pflag.FlagSet) error {
-	if err := viper.BindPFlags(flags); err != nil {
+	// Cobra adds a boolean --version flag to the root command on its own once
+	// Version is set. Binding it would put the literal string "false" under the
+	// `version` key, which the release version also uses, and the bare command
+	// would then fail with `"vfalse" is not a valid semantic version`. The release
+	// subcommand's own --version is a string flag and is bound normally.
+	var err error
+	flags.VisitAll(func(f *pflag.Flag) {
+		if err != nil {
+			return
+		}
+		if f.Name == "version" && f.Value.Type() == "bool" {
+			return
+		}
+		err = viper.BindPFlag(f.Name, f)
+	})
+	if err != nil {
 		return err
 	}
 	// Backwards compatibility with the pre-cobra tool's environment interface.

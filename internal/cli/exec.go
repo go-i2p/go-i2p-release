@@ -36,12 +36,26 @@ func (a Action) String() string {
 type Journal struct {
 	Actions []Action
 	out     io.Writer
+	quiet   bool
 }
 
 // NewJournal returns a journal that echoes progress to out.
 func NewJournal(out io.Writer) *Journal { return &Journal{out: out} }
 
+// SetQuiet suppresses progress lines; deliverable output written with printf
+// (the plan and inspection tables) is unaffected.
+func (j *Journal) SetQuiet(q bool) { j.quiet = q }
+
+// logf records a progress line, suppressed by --quiet.
 func (j *Journal) logf(format string, args ...any) {
+	if j.quiet {
+		return
+	}
+	j.printf(format, args...)
+}
+
+// printf writes output that is the command's deliverable, regardless of --quiet.
+func (j *Journal) printf(format string, args ...any) {
 	if j.out != nil {
 		fmt.Fprintf(j.out, format+"\n", args...)
 	}

@@ -101,28 +101,47 @@ are still honoured.
 2. **Order** — topologically sorts that graph so a dependency always precedes its
    dependents. The layer table below is only a tie-breaker, so the order follows
    what the modules actually require rather than a hand-maintained list.
-3. **Inspect** — detects each repository's default branch (`origin/HEAD` when origin
-   confirms it, else `main`/`master`/`trunk`, else the checked-out branch), fetches
-   origin, records the tip, and refuses to run on tracked local changes unless
-   `--allow-dirty` is passed. Untracked files never block a run. `plan` is strictly
-   read-only: it never checks out, merges, commits or pushes.
+3. **Inspect** — detects each repository's default branch (`origin/HEAD` only when
+   origin confirms the branch exists, else `main`/`master`/`trunk`, else the
+   checked-out branch), fetches origin, records the tip, and refuses to run on
+   tracked local changes unless `--allow-dirty` is passed. Untracked files never
+   block a run. `plan` is strictly read-only: it never checks out, merges, commits
+   or pushes. With `--all`, a directory that has a `go.mod` but no git metadata is
+   listed and skipped rather than aborting the run; a repository from the known
+   release set that is not a checkout is a hard error instead.
 4. **Sync** — fast-forwards clean working trees onto their tip.
-5. **Bump** — drops local `replace` directives, then `go get`s each in-namespace
-   dependency at its origin tip and runs `go mod tidy`.
-6. **Verify** — `go build ./...`, and `go test ./...` by default. A failure stops
-   the run before anything is committed or tagged, so a broken tip never reaches
-   the shared namespace.
-7. **Check in** — commits `go.mod`/`go.sum` in each repository that changed.
-8. **Push** — publishes each repository's default branch.
+5. **Bump** — snapshots each module's `go.mod`/`go.sum`, drops local `replace`
+   directives, then `go get`s each in-namespace dependency at its origin tip and
+   runs `go mod tidy`. If a dependency cannot be resolved, that module is restored
+   to its snapshot and the run stops, so a failed `go get` never leaves a dropped
+   replace behind.
+6. **Verify** — `go build ./...`, and `go test ./...` by default. On failure every
+   module rewritten by this pass is restored from its snapshot and the run stops
+   before anything is committed or pushed, so a broken tip never reaches the shared
+   namespace and no `go.mod` is left pointing at an unreachable revision.
+7. **Check in** — stages and commits only the module files that actually changed,
+   by explicit pathspec, so a missing `go.sum` cannot fail the add atomically and a
+   pre-staged unrelated file is never swept into the dependency commit.
+8. **Push** — publishes each repository's default branch, skipping any whose branch
+   cannot be confirmed on origin (so a stale `origin/HEAD` never creates a phantom
+   branch).
 9. **Tag** (release only) — creates an annotated tag in every repository and pushes
-   it. Existing tags are checked *before* any work begins, so a collision aborts
-   with nothing changed.
+   it. Existing tags are checked *before* any work begins — on the host via
+   `git ls-remote`, not just local refs, since `git fetch` does not populate
+   remote-tracking refs for tags — so a collision aborts with nothing changed. A
+   `v2+` version is always refused because the namespace has no `/vN` module paths,
+   whatever `--tag-existing` says.
 10. **Post-tag bump** (`--post-tag-bump`) — rewrites dependencies from
     pseudo-versions to the new tag, verifies, checks in and pushes again, so the
     released tree references releases rather than commits.
 
 ## Notable behaviours
 
+- **A failed run leaves the tree as it found it.** Each module's `go.mod`/`go.sum`
+  are snapshotted before bumping; if a dependency cannot be resolved or verification
+  fails, those files are restored and nothing is committed, tagged or pushed. A
+  broken or unreachable tip can never be checked in, and a dropped `replace` is never
+  left behind.
 - **Bumping targets the origin tip, not local `HEAD`.** `go get` resolves commits
   over the network, so an unpushed local commit would fail to fetch.
 - **`--standalone` (default) sets `GOWORK=off`.** A `go.work` in the namespace

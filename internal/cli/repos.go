@@ -93,9 +93,6 @@ type Repo struct {
 	// Snapshot holds the pre-bump go.mod/go.sum so a failed run can be unwound.
 	// Set by the bump steps before they touch the working tree.
 	Snapshot *modSnapshot
-	// BumpFailed records that this module could not be moved to its tips; its
-	// snapshot is restored and it is left out of the commit and push.
-	BumpFailed bool
 
 	// remotes caches the branch names seen on origin so detection is one ls-remote;
 	// branchDetected stops the choice (and its warnings) being recomputed.
@@ -130,6 +127,13 @@ func Discover(cfg *Config) (*Scan, error) {
 		module, deps, warns := readModule(filepath.Join(path, "go.mod"), cfg.Prefix)
 		r.Module, r.Deps, r.Warnings = module, deps, warns
 		if !r.IsRepo {
+			// A repository from the known release set that is not a checkout is a
+			// real problem, not something to walk past: it would silently leave a
+			// core module out of a namespace-wide release.
+			if layerOf(name) != -1 {
+				return nil, fmt.Errorf("%s: %s is in the release set but is not a git repository (%s has no .git); clone it or exclude it with --exclude",
+					name, path, path)
+			}
 			r.SkipReason = "not a git repository"
 		}
 		if module != "" && module != cfg.Prefix+"/"+name {
